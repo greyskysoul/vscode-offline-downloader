@@ -65,6 +65,7 @@ LATEST_VERSION_PLATFORM = "win32-x64-user"
 DEFAULT_CONFIG_NAME = "download_config.yaml"
 ARIA2_CONNECTIONS = 8
 ARIA2_START_TIMEOUT = 10.0
+PROGRESS_INTERVAL = 0.5
 
 MARKETPLACE_QUERY_URL = (
     "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery"
@@ -711,7 +712,7 @@ def _download_native(
                 fh.write(chunk)
                 downloaded += len(chunk)
                 now = time.monotonic()
-                if now - last_progress >= 0.25:
+                if now - last_progress >= PROGRESS_INTERVAL:
                     _print_progress(
                         downloaded,
                         total,
@@ -784,7 +785,7 @@ def _download_with_wget(
         while process.poll() is None:
             size = part.stat().st_size if part.exists() else 0
             now = time.monotonic()
-            if now - last_progress >= 0.25:
+            if now - last_progress >= PROGRESS_INTERVAL:
                 _print_progress(
                     size,
                     total,
@@ -976,7 +977,7 @@ class Aria2Backend:
                     reason = download.error_message or download.status
                     raise DownloaderError(f"aria2 下载失败: {reason}")
                 now = time.monotonic()
-                if now - last_progress >= 0.25:
+                if now - last_progress >= PROGRESS_INTERVAL:
                     _print_progress(
                         completed,
                         total,
@@ -986,7 +987,7 @@ class Aria2Backend:
                         speed=meter.update(completed, now),
                     )
                     last_progress = now
-                time.sleep(0.25)
+                time.sleep(PROGRESS_INTERVAL / 2)
         except BaseException:
             try:
                 download.remove(force=True, files=False)
