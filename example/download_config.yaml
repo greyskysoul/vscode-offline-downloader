@@ -1,0 +1,18 @@
+# 最小示例：Windows x64 安装包、中文语言包和 Python 插件。
+# 运行：
+#   python vscode_offline_downloader.py all -c example/download_config.yaml -C example --no-remote
+
+vscode:
+  version:        # 留空表示最新稳定版，也可以写 '1.128.1'
+  targets:
+    - platform: win32-x64
+      package: user
+
+extensions:
+  - name: MS-CEINTL.vscode-language-pack-zh-hans
+    path: ext
+
+  - name: ms-python.python
+    path: ext/python
+    version:        # 留空：选择 win32-x64 平台的最新版本
+    target: win32-x64

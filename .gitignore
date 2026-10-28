@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Downloader output
+*.part
+*.vsix
+*.exe
+*.deb
+*.rpm
+*.tar.gz
+*.log
