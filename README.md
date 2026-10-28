@@ -17,6 +17,7 @@
   - 语言包自动匹配 VS Code 版本
 - 支持断点续传、SHA256 校验、失败重试和下载进度显示
 - 可选 aria2 多连接下载、wget 或内置下载器，自动选择可用方案
+- 扫描已有离线包目录并导出配置，只下载有更新的安装包和插件
 - 下载前展示完整清单并确认
 
 ## 环境要求
@@ -105,22 +106,66 @@ python vscode_offline_downloader.py all --download-method aria2 --yes
 `--targets` 会覆盖配置文件中的 `vscode.targets`。平台专用插件的架构会跟随
 `--targets`；`--targets none` 时回退到配置中的 `vscode.targets`。
 
+## 导出配置（增量更新）
+
+在已有离线包的目录中运行：
+
+```bash
+python vscode_offline_downloader.py export
+```
+
+脚本会递归扫描当前目录，识别 VS Code 安装包和 `.vsix` 插件，并把扫描到的版本写入
+`download_config.yaml` 的 `current_version` 字段。把生成的文件放到另一台电脑上运行：
+
+```bash
+python vscode_offline_downloader.py all -c download_config.yaml
+```
+
+下载器会查询最新版本，只下载比 `current_version` 更新的安装包和插件；已经是最新的
+项目会跳过。
+
+插件条目里的 `path` 是相对扫描目录的。另一台电脑上保持相同的目录结构，或用 `-C`
+指定离线包根目录即可。
+
+```bash
+# 指定扫描目录
+python vscode_offline_downloader.py export -C /path/to/offline-packages
+
+# 指定输出文件
+python vscode_offline_downloader.py export -o config/update.yaml
+
+# 覆盖已存在的输出文件
+python vscode_offline_downloader.py export --force
+```
+
+扫描规则：
+
+- Windows：`VSCodeUserSetup-*.exe`、`VSCodeSetup-*.exe`
+- Linux：`code_*.deb`、`code-*.rpm`、`code-stable-*.tar.gz`
+- macOS：`VSCode-darwin-*.zip`
+- 插件：读取 `.vsix` 内的 `extension.vsixmanifest`，识别 `publisher.name`、版本和目标平台
+
+如果同一架构或同一插件存在多个版本，脚本会使用最高版本并打印提示。
+`current_version` 只用于判断是否有更新，不会把下载限制在旧版本；需要固定版本时继续使用
+`version` 字段。
+
 ## 命令说明
 
 ```text
-python vscode_offline_downloader.py [all|installers|remote|extensions] [选项]
+python vscode_offline_downloader.py [all|installers|remote|extensions|export] [选项]
 ```
 
 | 选项 | 说明 |
 | --- | --- |
 | `-c, --config download_config.yaml` | 配置文件路径；不指定时在当前目录查找默认文件 |
+| `-o, --output download_config.yaml` | `export` 输出的配置文件 |
 | `--targets <列表>` | 逗号分隔的安装包平台；`all` 全选，`none` 不下载安装包 |
 | `--download-method aria2` | 下载方式：`aria2`、`wget` 或 `none`；不指定时自动选择 |
 | `--cli-flavor alpine` | 远程 CLI 类型，默认 `alpine`；可选 `linux` |
 | `--no-remote` | `all` 模式下不下载远程 Server/CLI |
 | `-y, --yes` | 跳过下载前的 y/N 确认 |
-| `-C, --base-dir .` | 下载根目录，默认当前目录 |
-| `--force` | 覆盖已存在的文件 |
+| `-C, --base-dir .` | 下载根目录；`export` 时作为扫描目录 |
+| `--force` | 覆盖已存在的文件；`export` 时覆盖输出配置 |
 | `--dry-run` | 只显示计划，不实际下载 |
 | `--retries 3` | 下载失败重试次数 |
 | `--timeout 60` | 网络超时时间（秒） |
@@ -165,6 +210,7 @@ python vscode_offline_downloader.py installers --download-method none
 ```yaml
 vscode:
   version:        # 可选；留空或省略表示最新稳定版，例如 '1.128.1'
+  current_version: '1.143.1'  # 可选；当前已有版本，只下载更新的版本
   targets:
     - platform: win32-x64
       package: user
@@ -180,8 +226,8 @@ extensions:
 
   - name: ms-vscode.cpptools
     path: ext/ccpp
-    version: '1.33.4'
     target: linux-x64
+    current_version: '1.35.5'  # 可选；已安装版本
 
   - name: some.publisher.extension
     path: ext
@@ -192,7 +238,8 @@ extensions:
 
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
-| `version` | 否 | VS Code 版本号，如 `1.128.1`；留空或省略表示最新稳定版 |
+| `version` | 否 | 固定 VS Code 版本，如 `1.128.1`；设置后不会再检查更新 |
+| `current_version` | 否 | 当前已有版本；只下载比它更新的版本 |
 | `targets` | 否 | 安装包列表；省略时使用内置默认值，`targets: []` 表示不下载安装包 |
 
 `targets` 中每一项包含：
@@ -201,6 +248,7 @@ extensions:
 | --- | --- | --- |
 | `platform` | 是 | 平台和架构：`win32-x64`、`win32-arm64`、`linux-x64`、`linux-arm64`、`linux-armhf`、`darwin-arm64`、`darwin-universal` |
 | `package` | 否 | 安装包类型：Windows 用 `user`/`system`，Linux 用 `deb`/`rpm`/`tgz`，macOS 用 `zip`；省略时 Windows 默认 `user`、Linux 默认 `deb`、macOS 默认 `zip` |
+| `current_version` | 否 | 该架构当前已有版本；会覆盖全局 `vscode.current_version` |
 
 也可以直接写平台 ID：
 
@@ -222,15 +270,20 @@ vscode:
 | --- | --- | --- |
 | `name` | 是 | Marketplace 插件 ID，格式为 `publisher.extension` |
 | `path` | 否 | 保存目录，相对于运行目录或 `--base-dir`；默认当前目录 |
-| `version` | 否 | 插件版本；留空或省略表示最新版本 |
+| `version` | 否 | 固定插件版本；设置后不会再检查更新 |
+| `current_version` | 否 | 当前已有版本；只下载比它更新的版本 |
 | `target` | 否 | 平台专用版本，如 `win32-x64`、`linux-x64`、`linux-arm64`、`alpine-x64` |
+
+`version` 用于固定版本，`current_version` 用于增量更新。两者同时存在时，`version`
+优先，不再检查更新。
 
 平台专用插件可以写 `target` 标记。实际下载的架构会跟随 `vscode.targets`，而不是固定使用
 这里的 `target`：
 
 - `vscode.targets` 选择 `linux-arm64`，就只下载 `linux-arm64` 插件变体；
 - 选择多个架构时，每个架构各下载一个变体；
-- 配置里有对应架构的条目时沿用其版本，否则使用该架构的最新版本。
+- 配置里有对应架构的条目时沿用其版本，否则使用该架构的最新版本；
+- 带 `current_version` 的显式架构会保留，即使不在 `vscode.targets` 中。
 
 如果插件没有写 `target`，但 Marketplace 上只提供平台专用版本（或平台版本明显新于
 通用版本），脚本会自动按 `vscode.targets` 展开。例如 `ms-vscode.cpptools`
@@ -326,6 +379,28 @@ python -m pip install pyyaml
 **当前目录没有 download_config.yaml**
 
 `all` 会只下载交互式选择的安装包。需要下载插件时，请准备配置文件，或用 `-c` 指定路径。
+
+**export 提示输出文件已存在**
+
+```bash
+python vscode_offline_downloader.py export --force
+# 或
+python vscode_offline_downloader.py export -o other.yaml
+```
+
+**export 没有识别到安装包或插件**
+
+确认文件是常见的 VS Code 安装包命名，并且 `.vsix` 内包含 `extension.vsixmanifest`。
+可以用 `-C` 指定实际目录：
+
+```bash
+python vscode_offline_downloader.py export -C /path/to/packages
+```
+
+**current_version 和 version 有什么区别**
+
+`version` 表示固定下载这个版本；`current_version` 表示当前已有版本，只下载更新的版本。
+`export` 生成的是 `current_version`。
 
 **插件下载返回 404**
 

@@ -8,7 +8,8 @@ VS Code 离线安装包下载器
      支持最新稳定版或指定版本，可通过交互式复选框或 --targets 选择平台；
   2. 下载远程开发 Server + CLI：Linux x64、Linux arm64；
   3. 按 download_config.yaml 下载插件（通用版本、平台专用版本和语言包匹配）；
-  4. 支持 aria2 多连接、wget 或内置 urllib 下载，未指定时自动选择。
+  4. 支持 aria2 多连接、wget 或内置 urllib 下载，未指定时自动选择；
+  5. 扫描已有离线包目录，导出带 current_version 的配置，用于增量更新。
 
 依赖：Python 3.8+、PyYAML；aria2p/aria2c 或 wget 可选。
 
@@ -17,6 +18,7 @@ VS Code 离线安装包下载器
   python vscode_offline_downloader.py installers --dry-run
   python vscode_offline_downloader.py installers --targets win32-x64-user,linux-deb-x64
   python vscode_offline_downloader.py extensions --config download_config.yaml
+  python vscode_offline_downloader.py export -o download_config.yaml
 """
 
 from __future__ import annotations
@@ -29,20 +31,24 @@ import http.client
 import json
 import math
 import os
+import plistlib
 import re
 import secrets
 import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import time
 import unicodedata
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
+from xml.etree import ElementTree
 
 try:
     import yaml
@@ -101,6 +107,29 @@ TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 VSCODE_VERSION_RE = re.compile(
     r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$"
 )
+WINDOWS_INSTALLER_RE = re.compile(
+    r"^VSCode(User)?Setup-(x64|arm64)-"
+    r"(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\.exe$",
+    re.IGNORECASE,
+)
+LINUX_DEB_RE = re.compile(
+    r"^code_(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)-\d+_"
+    r"(amd64|arm64|armhf)\.deb$",
+    re.IGNORECASE,
+)
+LINUX_RPM_RE = re.compile(
+    r"^code-(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)-\d+"
+    r"(?:\.[A-Za-z0-9]+)*\.(x86_64|aarch64|armv7hl)\.rpm$",
+    re.IGNORECASE,
+)
+LINUX_TGZ_RE = re.compile(
+    r"^code-stable-(x64|arm64|armhf)-\d+\.tar\.gz$",
+    re.IGNORECASE,
+)
+DARWIN_ZIP_RE = re.compile(
+    r"^VSCode-darwin-(arm64|universal)\.zip$",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -126,12 +155,14 @@ class ExtensionSpec:
     path: str
     version: Optional[str] = None
     target: Optional[str] = None
+    current_version: Optional[str] = None
 
 
 @dataclass(frozen=True)
 class PackageTarget:
     platform: str
     default: bool = False
+    current_version: Optional[str] = None
 
 
 # VS Code 稳定版可下载的安装包。可通过交互式复选框或 --targets 选择。
@@ -193,6 +224,7 @@ class DownloadConfig:
     vscode_targets: Optional[List[PackageTarget]]
     extensions: List[ExtensionSpec]
     vscode_version: Optional[str] = None
+    vscode_current_version: Optional[str] = None
 
 
 @dataclass
@@ -1557,6 +1589,7 @@ def download_installers(
     timeout: float,
     download_method: str,
     vscode_version: Optional[str] = None,
+    vscode_current_version: Optional[str] = None,
     stats: RunStats,
 ) -> None:
     print("\n[1/3] VS Code 安装包")
@@ -1582,6 +1615,12 @@ def download_installers(
     for target, info in resolved:
         print(f"\n  {target.platform}")
         detail(f"版本: {info.version or 'latest'}")
+        baseline = target.current_version or vscode_current_version
+        if vscode_version is None and baseline and info.version:
+            if version_key(info.version) <= version_key(baseline):
+                detail(f"已是最新（当前 {baseline}），跳过")
+                stats.record("skipped", target.platform)
+                continue
         dest = base_dir / info.filename
         try:
             result = download_file(
@@ -1923,6 +1962,19 @@ def vscode_platform_id(platform: str, package: str) -> str:
     return platform  # macOS zip
 
 
+def parse_optional_version(value: Any, label: str) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text.lower() in ("", "latest", "*"):
+        return None
+    if not VSCODE_VERSION_RE.match(text):
+        raise DownloaderError(
+            f"{label} 格式不正确: {text!r}（示例: 1.128.1）"
+        )
+    return text
+
+
 def parse_vscode_targets(
     raw_targets: Any,
 ) -> Optional[List[PackageTarget]]:
@@ -1931,8 +1983,9 @@ def parse_vscode_targets(
     if not isinstance(raw_targets, list):
         raise DownloaderError("vscode.targets 必须是数组")
 
-    selected: List[PackageTarget] = []
+    selected: Dict[str, PackageTarget] = {}
     for index, item in enumerate(raw_targets, 1):
+        current_version: Optional[str] = None
         if isinstance(item, str):
             # 兼容直接写内部平台 ID，如 win32-x64-user
             platform_id = item.strip().lower()
@@ -1958,44 +2011,59 @@ def parse_vscode_targets(
                     f"vscode 第 {index} 项组合无效: "
                     f"platform={platform!r}, package={package!r}"
                 )
+            current_version = parse_optional_version(
+                item.get("current_version"),
+                f"vscode 第 {index} 项 current_version",
+            )
         else:
             raise DownloaderError(
                 f"vscode 第 {index} 项必须是字符串或包含 "
                 "platform/package 的对象"
             )
 
-        if target not in selected:
-            selected.append(target)
-    return selected
+        if current_version:
+            target = PackageTarget(
+                platform=target.platform,
+                default=target.default,
+                current_version=current_version,
+            )
+        existing = selected.get(target.platform)
+        if existing is None:
+            selected[target.platform] = target
+        elif target.current_version and not existing.current_version:
+            selected[target.platform] = target
+    return list(selected.values())
 
 
 def parse_vscode_config(
     raw_vscode: Any,
-) -> Tuple[Optional[str], Optional[List[PackageTarget]]]:
-    """解析 vscode 段（version/targets）；也支持直接给出平台列表。"""
+) -> Tuple[
+    Optional[str],
+    Optional[List[PackageTarget]],
+    Optional[str],
+]:
+    """解析 vscode 段（version/targets/current_version）。"""
     if raw_vscode is None:
-        return None, None
+        return None, None, None
     if isinstance(raw_vscode, list):
-        return None, parse_vscode_targets(raw_vscode)
+        return None, parse_vscode_targets(raw_vscode), None
     if not isinstance(raw_vscode, dict):
         raise DownloaderError(
             "vscode 必须是包含 version/targets 的对象，或平台列表"
         )
 
-    raw_version = raw_vscode.get("version")
-    version_text = ""
-    if raw_version is not None:
-        version_text = str(raw_version).strip()
-        if version_text.lower() in ("", "latest", "*"):
-            version_text = ""
-        elif not VSCODE_VERSION_RE.match(version_text):
-            raise DownloaderError(
-                f"vscode.version 格式不正确: {version_text!r}"
-                "（示例: 1.128.1）"
-            )
-
+    version_text = parse_optional_version(
+        raw_vscode.get("version"), "vscode.version"
+    )
+    current_version = parse_optional_version(
+        raw_vscode.get("current_version"), "vscode.current_version"
+    )
     raw_targets = raw_vscode.get("targets")
-    return version_text or None, parse_vscode_targets(raw_targets)
+    return (
+        version_text,
+        parse_vscode_targets(raw_targets),
+        current_version,
+    )
 
 
 def extension_targets_for_vscode_targets(
@@ -2064,6 +2132,7 @@ def adapt_extension_specs(
     - 配置里带 target 的插件按 (name, path) 分组；
     - 每个选中的架构生成一个下载项；
     - 如果配置里有该架构的精确条目，沿用其版本，否则用该架构的最新版本；
+    - 带 current_version 的显式架构会保留，即使不在 vscode.targets 中；
     - 没有写 target，但 Marketplace 上只有平台专用版本的插件，也会自动按架构展开。
     """
     if not selected_targets:
@@ -2102,6 +2171,7 @@ def adapt_extension_specs(
                             path=base.path,
                             version=None,
                             target=target,
+                            current_version=base.current_version,
                         )
                     )
                 continue
@@ -2112,6 +2182,7 @@ def adapt_extension_specs(
                     path=base.path,
                     version=base.version,
                     target=None,
+                    current_version=base.current_version,
                 )
             )
             continue
@@ -2121,13 +2192,27 @@ def adapt_extension_specs(
             for spec in group
             if spec.target
         }
-        for target in selected_targets:
+        current_by_target = {
+            spec.target: spec.current_version
+            for spec in group
+            if spec.target
+        }
+        targets_for_group = list(selected_targets)
+        for spec in group:
+            if (
+                spec.target
+                and spec.current_version
+                and spec.target not in targets_for_group
+            ):
+                targets_for_group.append(spec.target)
+        for target in targets_for_group:
             adapted.append(
                 ExtensionSpec(
                     name=key[0],
                     path=key[1],
                     version=version_by_target.get(target),
                     target=target,
+                    current_version=current_by_target.get(target),
                 )
             )
     return adapted
@@ -2176,6 +2261,20 @@ def parse_extension_specs(raw_extensions: Any) -> List[ExtensionSpec]:
             )
             version_text = ""
 
+        raw_current_version = item.get("current_version")
+        if raw_current_version is None:
+            current_version_text = ""
+        elif isinstance(raw_current_version, str):
+            current_version_text = raw_current_version.strip()
+        else:
+            warn(
+                f"extensions 第 {index} 项 current_version 不是字符串，"
+                f"已按 {raw_current_version!r} 处理；建议使用字符串"
+            )
+            current_version_text = str(raw_current_version).strip()
+        if current_version_text.lower() in ("", "latest", "*"):
+            current_version_text = ""
+
         raw_target = item.get("target")
         target_text: Optional[str] = None
         if raw_target is not None:
@@ -2191,6 +2290,7 @@ def parse_extension_specs(raw_extensions: Any) -> List[ExtensionSpec]:
                 path=path_text,
                 version=version_text or None,
                 target=target_text,
+                current_version=current_version_text or None,
             )
         )
 
@@ -2217,13 +2317,14 @@ def load_download_config(path: Path) -> DownloadConfig:
     if not isinstance(data, dict):
         raise DownloaderError("配置文件顶层必须是 YAML 对象")
 
-    vscode_version, vscode_targets = parse_vscode_config(
-        data.get("vscode")
+    vscode_version, vscode_targets, vscode_current_version = (
+        parse_vscode_config(data.get("vscode"))
     )
     return DownloadConfig(
         vscode_targets=vscode_targets,
         extensions=parse_extension_specs(data.get("extensions")),
         vscode_version=vscode_version,
+        vscode_current_version=vscode_current_version,
     )
 
 
@@ -2259,6 +2360,12 @@ def download_extensions(
             else:
                 detail(f"最新版本: {version}")
 
+            if spec.version is None and spec.current_version:
+                if version_key(version) <= version_key(spec.current_version):
+                    detail(f"已是最新（当前 {spec.current_version}），跳过")
+                    stats.record("skipped", label)
+                    continue
+
             dest_dir = resolve_output_dir(base_dir, spec.path)
             filename = extension_filename(spec.name, version, spec.target)
             dest = dest_dir / filename
@@ -2288,6 +2395,351 @@ def download_extensions(
 
 
 # ---------------------------------------------------------------------------
+# 扫描目录并导出配置
+# ---------------------------------------------------------------------------
+
+
+def _iter_scan_files(root: Path):
+    skip_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules"}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in skip_dirs]
+        for filename in filenames:
+            if filename.endswith((".part", ".aria2")):
+                continue
+            yield Path(dirpath) / filename
+
+
+def _relative_dir(root: Path, path: Path) -> str:
+    try:
+        relative = path.parent.relative_to(root)
+    except ValueError:
+        relative = Path(".")
+    return relative.as_posix() or "."
+
+
+def _read_tgz_version(path: Path) -> Optional[str]:
+    try:
+        with tarfile.open(path, "r:gz") as archive:
+            for member in archive:
+                if not member.isfile():
+                    continue
+                if not member.name.endswith("/resources/app/product.json"):
+                    continue
+                fileobj = archive.extractfile(member)
+                if fileobj is None:
+                    continue
+                data = json.load(fileobj)
+                version = str(data.get("version") or "").strip()
+                return version or None
+    except (OSError, tarfile.TarError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return None
+
+
+def _read_darwin_version(path: Path) -> Optional[str]:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            for name in archive.namelist():
+                if not name.endswith("Contents/Info.plist"):
+                    continue
+                data = plistlib.loads(archive.read(name))
+                version = str(
+                    data.get("CFBundleShortVersionString") or ""
+                ).strip()
+                if version:
+                    return version
+    except (OSError, zipfile.BadZipFile, plistlib.InvalidFileException):
+        return None
+    return None
+
+
+def _target_with_version(
+    platform_id: str, version: Optional[str]
+) -> Optional[Tuple[PackageTarget, Optional[str]]]:
+    base = PACKAGE_TARGET_BY_ID.get(platform_id)
+    if base is None:
+        return None
+    return (
+        PackageTarget(
+            platform=base.platform,
+            default=base.default,
+            current_version=version,
+        ),
+        version,
+    )
+
+
+def parse_installer_filename(
+    path: Path,
+) -> Optional[Tuple[PackageTarget, Optional[str]]]:
+    name = path.name
+
+    match = WINDOWS_INSTALLER_RE.match(name)
+    if match:
+        user = bool(match.group(1))
+        arch = match.group(2).lower()
+        platform_id = f"win32-{arch}" + ("-user" if user else "")
+        return _target_with_version(platform_id, match.group(3))
+
+    match = LINUX_DEB_RE.match(name)
+    if match:
+        arch = {"amd64": "x64", "arm64": "arm64", "armhf": "armhf"}[
+            match.group(2).lower()
+        ]
+        return _target_with_version(f"linux-deb-{arch}", match.group(1))
+
+    match = LINUX_RPM_RE.match(name)
+    if match:
+        arch = {
+            "x86_64": "x64",
+            "aarch64": "arm64",
+            "armv7hl": "armhf",
+        }[match.group(2).lower()]
+        return _target_with_version(f"linux-rpm-{arch}", match.group(1))
+
+    match = LINUX_TGZ_RE.match(name)
+    if match:
+        arch = match.group(1).lower()
+        version = _read_tgz_version(path)
+        return _target_with_version(f"linux-{arch}", version)
+
+    match = DARWIN_ZIP_RE.match(name)
+    if match:
+        arch = match.group(1).lower()
+        version = _read_darwin_version(path)
+        return _target_with_version(f"darwin-{arch}", version)
+
+    return None
+
+
+def scan_installers(root: Path) -> List[PackageTarget]:
+    found: Dict[str, PackageTarget] = {}
+    for path in _iter_scan_files(root):
+        parsed = parse_installer_filename(path)
+        if parsed is None:
+            continue
+        target, version = parsed
+        existing = found.get(target.platform)
+        if existing is None:
+            found[target.platform] = target
+            continue
+        old_version = existing.current_version
+        if version and (
+            not old_version or version_key(version) > version_key(old_version)
+        ):
+            warn(
+                f"发现多个 {target.platform} 安装包，"
+                f"使用较新的 {version}（忽略 {old_version or '未知版本'}）"
+            )
+            found[target.platform] = target
+    order = {
+        target.platform: index for index, target in enumerate(PACKAGE_TARGETS)
+    }
+    return sorted(
+        found.values(), key=lambda item: order.get(item.platform, 999)
+    )
+
+
+def read_vsix_identity(
+    path: Path,
+) -> Optional[Tuple[str, str, Optional[str]]]:
+    target_from_name = None
+    match = re.search(r"@([A-Za-z0-9._-]+)\.vsix$", path.name, re.IGNORECASE)
+    if match:
+        target_from_name = match.group(1).lower()
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            try:
+                manifest = archive.read("extension.vsixmanifest")
+            except KeyError:
+                manifest = None
+
+            if manifest:
+                try:
+                    document = ElementTree.fromstring(manifest)
+                except ElementTree.ParseError:
+                    document = None
+                if document is not None:
+                    for element in document.iter():
+                        tag = element.tag.rsplit("}", 1)[-1]
+                        if tag != "Identity":
+                            continue
+                        publisher = (element.get("Publisher") or "").strip()
+                        extension = (element.get("Id") or "").strip()
+                        version = (element.get("Version") or "").strip()
+                        target = (
+                            element.get("TargetPlatform") or ""
+                        ).strip().lower()
+                        if publisher and extension and version:
+                            if target in ("universal", "undefined"):
+                                target = None
+                            elif not target:
+                                target = target_from_name
+                            return (
+                                f"{publisher}.{extension}",
+                                version,
+                                target,
+                            )
+
+            try:
+                package = json.loads(archive.read("extension/package.json"))
+            except (KeyError, json.JSONDecodeError, UnicodeDecodeError):
+                package = None
+            if package:
+                publisher = str(package.get("publisher") or "").strip()
+                extension = str(package.get("name") or "").strip()
+                version = str(package.get("version") or "").strip()
+                if publisher and extension and version:
+                    return (
+                        f"{publisher}.{extension}",
+                        version,
+                        target_from_name,
+                    )
+    except (OSError, zipfile.BadZipFile):
+        return None
+    return None
+
+
+def scan_extensions(root: Path) -> List[ExtensionSpec]:
+    found: Dict[Tuple[str, Optional[str]], ExtensionSpec] = {}
+    for path in _iter_scan_files(root):
+        if path.suffix.lower() != ".vsix":
+            continue
+        identity = read_vsix_identity(path)
+        if identity is None:
+            warn(f"无法读取插件信息，跳过: {path}")
+            continue
+        name, version, target = identity
+        key = (name.lower(), target)
+        spec = ExtensionSpec(
+            name=name,
+            path=_relative_dir(root, path),
+            current_version=version,
+            target=target,
+        )
+        existing = found.get(key)
+        if existing is None:
+            found[key] = spec
+            continue
+        old_version = existing.current_version or ""
+        if version_key(version) > version_key(old_version):
+            warn(
+                f"发现多个 {name}{'@' + target if target else ''}，"
+                f"使用较新的 {version}（忽略 {old_version or '未知版本'}）"
+            )
+            found[key] = spec
+    return sorted(
+        found.values(),
+        key=lambda item: (
+            item.name.lower(),
+            item.target or "",
+            item.path,
+        ),
+    )
+
+
+def package_target_config(target: PackageTarget) -> Dict[str, str]:
+    platform = target.platform
+    if platform.startswith("win32-"):
+        if platform.endswith("-user"):
+            return {
+                "platform": platform[: -len("-user")],
+                "package": "user",
+            }
+        return {"platform": platform, "package": "system"}
+    if platform.startswith("linux-deb-"):
+        return {
+            "platform": "linux-" + platform[len("linux-deb-") :],
+            "package": "deb",
+        }
+    if platform.startswith("linux-rpm-"):
+        return {
+            "platform": "linux-" + platform[len("linux-rpm-") :],
+            "package": "rpm",
+        }
+    if platform in ("linux-x64", "linux-arm64", "linux-armhf"):
+        return {"platform": platform, "package": "tgz"}
+    if platform.startswith("darwin-"):
+        return {"platform": platform, "package": "zip"}
+    raise DownloaderError(f"无法导出的安装包平台: {platform}")
+
+
+def build_export_data(
+    installers: List[PackageTarget],
+    extensions: List[ExtensionSpec],
+) -> Dict[str, Any]:
+    target_items: List[Dict[str, str]] = []
+    for target in installers:
+        item = package_target_config(target)
+        if target.current_version:
+            item["current_version"] = target.current_version
+        target_items.append(item)
+
+    extension_items: List[Dict[str, str]] = []
+    for spec in extensions:
+        item: Dict[str, str] = {"name": spec.name, "path": spec.path}
+        if spec.target:
+            item["target"] = spec.target
+        if spec.current_version:
+            item["current_version"] = spec.current_version
+        extension_items.append(item)
+
+    return {
+        "vscode": {"targets": target_items},
+        "extensions": extension_items,
+    }
+
+
+def export_config(root: Path, output: Path, *, force: bool) -> None:
+    require_yaml()
+    root = root.resolve()
+    if not root.is_dir():
+        raise DownloaderError(f"扫描目录不存在: {root}")
+
+    installers = scan_installers(root)
+    extensions = scan_extensions(root)
+    if not installers and not extensions:
+        raise DownloaderError(f"没有在 {root} 中找到安装包或插件")
+
+    if output.exists() and not force:
+        raise DownloaderError(
+            f"输出文件已存在: {output}\n"
+            "使用 --force 覆盖，或用 -o 指定其他路径。"
+        )
+
+    data = build_export_data(installers, extensions)
+    content = (
+        "# 由 vscode_offline_downloader.py export 生成。\n"
+        "# current_version 表示扫描到的当前版本；运行时只下载更新的版本。\n"
+        "# 没有 current_version 的项目会正常下载。\n\n"
+        + yaml.safe_dump(
+            data,
+            allow_unicode=True,
+            sort_keys=False,
+            default_flow_style=False,
+            width=1000,
+        )
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        output.write_text(content, encoding="utf-8")
+    except OSError as error:
+        raise DownloaderError(f"写入配置失败: {output}\n{error}") from error
+
+    print(f"扫描目录: {root}")
+    for target in installers:
+        detail(
+            f"安装包: {target.platform}  "
+            f"当前版本: {target.current_version or '未知'}"
+        )
+    for spec in extensions:
+        label = spec.name + (f"@{spec.target}" if spec.target else "")
+        detail(f"插件: {label}  当前版本: {spec.current_version or '未知'}")
+    print(f"已导出: {output}")
+
+
+# ---------------------------------------------------------------------------
 # 汇总与命令行入口
 # ---------------------------------------------------------------------------
 
@@ -2297,7 +2749,7 @@ def print_summary(stats: RunStats, dry_run: bool) -> None:
     if dry_run:
         print(
             f"计划完成: {stats.planned} 项待下载，"
-            f"{stats.skipped} 项已存在，{len(stats.failures)} 项失败。"
+            f"{stats.skipped} 项跳过，{len(stats.failures)} 项失败。"
         )
     else:
         print(
@@ -2312,17 +2764,29 @@ def print_summary(stats: RunStats, dry_run: bool) -> None:
 
 def _extension_plan_line(spec: ExtensionSpec) -> str:
     label = spec.name + (f"@{spec.target}" if spec.target else "")
-    if is_language_pack(spec.name):
+    if spec.version:
+        version = spec.version
+    elif spec.current_version:
+        suffix = "auto" if is_language_pack(spec.name) else "latest"
+        version = f"{spec.current_version} -> {suffix}"
+    elif is_language_pack(spec.name):
         version = "auto"
     else:
-        version = spec.version or "latest"
+        version = "latest"
     return f"{label}  {version}"
 
 
 def installer_plan_section(
     targets: List[PackageTarget], version: Optional[str]
 ) -> Tuple[str, List[str]]:
-    items = [target.platform for target in targets]
+    items = [
+        (
+            f"{target.platform}  {target.current_version} -> latest"
+            if target.current_version
+            else target.platform
+        )
+        for target in targets
+    ]
     title = (
         f"VS Code 安装包（{len(items)} 个，"
         f"版本 {version or 'latest'}）"
@@ -2416,13 +2880,14 @@ def build_parser() -> argparse.ArgumentParser:
             "  python vscode_offline_downloader.py installers --targets "
             "win32-x64-user,linux-deb-x64,linux-deb-arm64\n"
             "  python vscode_offline_downloader.py extensions --config download_config.yaml\n"
+            "  python vscode_offline_downloader.py export -o download_config.yaml\n"
         ),
     )
     parser.add_argument(
         "action",
         nargs="?",
         default="all",
-        choices=["all", "installers", "remote", "extensions"],
+        choices=["all", "installers", "remote", "extensions", "export"],
         help="要执行的操作（默认 all）",
     )
     parser.add_argument(
@@ -2469,7 +2934,13 @@ def build_parser() -> argparse.ArgumentParser:
         "-C",
         "--base-dir",
         default=".",
-        help="下载根目录，默认当前目录",
+        help="下载根目录；export 时作为扫描目录，默认当前目录",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=DEFAULT_CONFIG_NAME,
+        help=f"export 输出的配置文件，默认 {DEFAULT_CONFIG_NAME}",
     )
     parser.add_argument(
         "-y",
@@ -2480,7 +2951,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="覆盖已存在的文件",
+        help="覆盖已存在的文件；export 时覆盖输出配置",
     )
     parser.add_argument(
         "--dry-run",
@@ -2528,6 +2999,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     config_exists = config_path.exists()
 
     try:
+        if args.action == "export":
+            output_path = resolve_path(Path.cwd(), args.output)
+            export_config(base_dir, output_path, force=args.force)
+            return 0
+
         download_method = "native"
         if args.action != "extensions":
             download_method = resolve_download_method(args.download_method)
@@ -2569,12 +3045,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.action == "installers":
             config_targets: Optional[List[PackageTarget]] = None
             vscode_version: Optional[str] = None
+            vscode_current_version: Optional[str] = None
             config_loaded = False
             if config_exists:
                 try:
                     config = load_download_config(config_path)
                     config_targets = config.vscode_targets
                     vscode_version = config.vscode_version
+                    vscode_current_version = config.vscode_current_version
                     config_loaded = True
                 except DownloaderError as error:
                     if config_explicit:
@@ -2606,6 +3084,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 timeout=args.timeout,
                 download_method=download_method,
                 vscode_version=vscode_version,
+                vscode_current_version=vscode_current_version,
                 stats=stats,
             )
             print_summary(stats, args.dry_run)
@@ -2720,6 +3199,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             timeout=args.timeout,
             download_method=download_method,
             vscode_version=config.vscode_version,
+            vscode_current_version=config.vscode_current_version,
             stats=stats,
         )
         if args.no_remote:
