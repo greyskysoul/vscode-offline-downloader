@@ -16,15 +16,25 @@
   - 指定版本或自动选择最新版本
   - 语言包自动匹配 VS Code 版本
 - 支持断点续传、SHA256 校验、失败重试和下载进度显示
+- 可选 aria2 多连接下载、wget 或内置下载器，自动选择可用方案
 - 下载前展示完整清单并确认
 
 ## 环境要求
 
 - Python 3.8+
 - PyYAML
+- 可选：aria2p（Python 3.11+）和 aria2c，用于多连接加速
+- 可选：wget
 
 ```bash
 python -m pip install -r requirements.txt
+```
+
+使用 aria2 加速时还需要安装 `aria2c`：
+
+```bash
+pkg install aria2        # Termux
+sudo apt install aria2   # Debian/Ubuntu
 ```
 
 ## 快速开始
@@ -87,6 +97,9 @@ python vscode_offline_downloader.py installers --targets all --yes
 
 # 跳过安装包，只下载远程组件和插件
 python vscode_offline_downloader.py all --targets none --yes
+
+# 使用 aria2 多连接下载安装包和远程组件
+python vscode_offline_downloader.py all --download-method aria2 --yes
 ```
 
 `--targets` 会覆盖配置文件中的 `vscode.targets`。平台专用插件的架构会跟随
@@ -102,6 +115,7 @@ python vscode_offline_downloader.py [all|installers|remote|extensions] [选项]
 | --- | --- |
 | `-c, --config download_config.yaml` | 配置文件路径；不指定时在当前目录查找默认文件 |
 | `--targets <列表>` | 逗号分隔的安装包平台；`all` 全选，`none` 不下载安装包 |
+| `--download-method aria2` | 下载方式：`aria2`、`wget` 或 `none`；不指定时自动选择 |
 | `--cli-flavor alpine` | 远程 CLI 类型，默认 `alpine`；可选 `linux` |
 | `--no-remote` | `all` 模式下不下载远程 Server/CLI |
 | `-y, --yes` | 跳过下载前的 y/N 确认 |
@@ -117,6 +131,32 @@ python vscode_offline_downloader.py [all|installers|remote|extensions] [选项]
 - 安装包、远程组件和语言包使用同一个 VS Code 版本。
 - 默认的 Alpine CLI 为静态链接，兼容 glibc 和 musl 发行版；目标环境需要 glibc 版时使用 `--cli-flavor linux`。
 - 下载地址由 VS Code 更新接口返回，使用官方 PRSS CDN，无需手动配置镜像。
+
+### 下载方式
+
+安装包和远程 Server/CLI 支持三种下载方式：
+
+| 方式 | 说明 |
+| --- | --- |
+| `aria2` | 使用 aria2p + aria2c，多连接分段下载，默认 8 连接，速度最快 |
+| `wget` | 调用系统 `wget`，单连接下载 |
+| `none` | 使用内置 urllib，单连接下载 |
+
+不指定 `--download-method` 时，按 `aria2` → `wget` → 内置的顺序自动选择可用方案。
+
+```bash
+# 强制使用 aria2
+python vscode_offline_downloader.py all --download-method aria2
+
+# 使用 wget
+python vscode_offline_downloader.py installers --download-method wget
+
+# 使用内置下载器
+python vscode_offline_downloader.py installers --download-method none
+```
+
+`aria2` 需要同时安装 `aria2p` 和 `aria2c`。VSIX 插件固定使用内置下载器，
+因为 Marketplace 返回 gzip 压缩内容，需要解压后再保存。
 
 ## 配置文件格式
 
@@ -237,10 +277,10 @@ deb/rpm/tgz 文件名中的时间戳由微软服务器决定，脚本会自动�
 
 ## 断点续传与校验
 
-- 安装包、Server、CLI 下载时使用 `.part` 临时文件，支持 HTTP Range 断点续传；网络中断后重新运行会从上次位置继续。
+- 安装包、Server、CLI 下载时使用 `.part` 临时文件，支持 HTTP Range 断点续传；aria2 方式还会保留 `.part.aria2` 控制文件，网络中断后重新运行会从上次位置继续。
 - 下载完成后才会重命名为正式文件名。
 - 使用最新稳定版时，脚本会通过微软更新接口校验 SHA256；指定 `vscode.version` 时接口不提供校验值，脚本会检查文件是否完整下载。
-- Marketplace 的 VSIX 响应通常是 gzip 压缩的，脚本会自动解压后再保存。
+- Marketplace 的 VSIX 响应通常是 gzip 压缩的，脚本会自动解压后再保存；VSIX 固定使用内置下载器。
 - 已存在的文件默认跳过；需要重新下载时加 `--force`。
 
 ## 下载进度
@@ -298,6 +338,7 @@ python -m pip install pyyaml
 
 脚本使用官方 PRSS CDN，该 CDN 在中国大陆也有节点。如果速度仍然不理想，可以：
 
+- 使用 aria2 多连接下载：`--download-method aria2`。单连接通常会被限速，多连接可以明显提速。
 - 检查本地网络或代理设置。
 - 使用 HTTP 代理时，在运行脚本的终端里设置 `HTTPS_PROXY` 和 `HTTP_PROXY`。`urllib` 不支持 SOCKS 代理，请使用代理软件提供的 HTTP 端口。
 - 避开网络高峰时段，或稍后重试。

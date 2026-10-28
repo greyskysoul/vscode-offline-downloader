@@ -7,9 +7,10 @@ VS Code 离线安装包下载器
   1. 下载 VS Code 安装包（Windows exe、Linux deb/rpm/tgz、macOS zip），
      支持最新稳定版或指定版本，可通过交互式复选框或 --targets 选择平台；
   2. 下载远程开发 Server + CLI：Linux x64、Linux arm64；
-  3. 按 download_config.yaml 下载插件（通用版本、平台专用版本和语言包匹配）。
+  3. 按 download_config.yaml 下载插件（通用版本、平台专用版本和语言包匹配）；
+  4. 支持 aria2 多连接、wget 或内置 urllib 下载，未指定时自动选择。
 
-依赖：Python 3.8+、PyYAML
+依赖：Python 3.8+、PyYAML；aria2p/aria2c 或 wget 可选。
 
 用法示例：
   python vscode_offline_downloader.py all
@@ -21,6 +22,7 @@ VS Code 离线安装包下载器
 from __future__ import annotations
 
 import argparse
+import atexit
 import gzip
 import hashlib
 import http.client
@@ -28,7 +30,10 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
+import socket
+import subprocess
 import sys
 import time
 import unicodedata
@@ -58,6 +63,8 @@ UPDATE_API_URL = "https://update.code.visualstudio.com/api/update/{platform}/sta
 UPDATE_DIRECT_URL = "https://update.code.visualstudio.com/{version}/{platform}/stable"
 LATEST_VERSION_PLATFORM = "win32-x64-user"
 DEFAULT_CONFIG_NAME = "download_config.yaml"
+ARIA2_CONNECTIONS = 8
+ARIA2_START_TIMEOUT = 10.0
 
 MARKETPLACE_QUERY_URL = (
     "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery"
@@ -524,6 +531,465 @@ def _print_progress(
     sys.stderr.flush()
 
 
+def _remove_partial_files(part: Path) -> None:
+    """删除临时文件和 aria2 控制文件。"""
+    part.unlink(missing_ok=True)
+    part.with_name(part.name + ".aria2").unlink(missing_ok=True)
+
+
+def _command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def _aria2_available() -> bool:
+    try:
+        import aria2p  # noqa: F401
+    except ImportError:
+        return False
+    return _command_exists("aria2c")
+
+
+def resolve_download_method(requested: Optional[str]) -> str:
+    """把 --download-method 转换为内部名称；未指定时自动选择。"""
+    if requested == "none":
+        return "native"
+    if requested == "aria2":
+        if not _aria2_available():
+            raise DownloaderError(
+                "aria2 下载需要 Python 3.11+、aria2p 和 aria2c：\n"
+                "  python -m pip install aria2p\n"
+                "  pkg install aria2        # Termux\n"
+                "  sudo apt install aria2   # Debian/Ubuntu"
+            )
+        return "aria2"
+    if requested == "wget":
+        if not _command_exists("wget"):
+            raise DownloaderError(
+                "未找到 wget，请先安装，或使用 --download-method none"
+            )
+        return "wget"
+
+    if _aria2_available():
+        return "aria2"
+    if _command_exists("wget"):
+        return "wget"
+    return "native"
+
+
+def download_method_label(method: str) -> str:
+    if method == "aria2":
+        return f"aria2（{ARIA2_CONNECTIONS} 连接）"
+    if method == "wget":
+        return "wget"
+    return "内置 urllib"
+
+
+def _content_length(url: str, timeout: float) -> Optional[int]:
+    try:
+        request = make_request(url, method="HEAD")
+        with urlopen(request, timeout=timeout) as response:
+            value = response.headers.get("Content-Length")
+            if value and value.isdigit():
+                return int(value)
+    except (HTTPError, URLError, http.client.HTTPException, OSError):
+        pass
+    return None
+
+
+def _download_native(
+    info: DownloadInfo,
+    part: Path,
+    *,
+    display_name: str,
+    timeout: float,
+    allow_resume: bool,
+) -> None:
+    """使用 urllib 单连接下载。"""
+    resume_from = 0
+    if allow_resume and part.exists():
+        resume_from = part.stat().st_size
+
+    request_headers: Dict[str, str] = {}
+    if resume_from > 0:
+        request_headers["Range"] = f"bytes={resume_from}-"
+
+    request = make_request(info.url, headers=request_headers)
+    with urlopen(request, timeout=timeout) as response:
+        status = getattr(response, "status", 200)
+        if status == 416 and resume_from > 0:
+            _remove_partial_files(part)
+            raise DownloaderError("服务器拒绝断点续传，准备重新下载")
+
+        content_encoding = (
+            response.headers.get("Content-Encoding", "") or ""
+        ).lower()
+        gzipped = "gzip" in content_encoding
+
+        if gzipped and resume_from > 0 and status == 206:
+            # Range 作用于压缩后的字节流，无法直接拼接解压后的内容。
+            _remove_partial_files(part)
+            raise DownloaderError("服务器返回压缩内容，无法断点续传")
+
+        if gzipped:
+            stream: Any = gzip.GzipFile(fileobj=response)
+            mode = "wb"
+            downloaded = 0
+            total: Optional[int] = None
+        else:
+            stream = response
+            if resume_from > 0 and status == 206:
+                mode = "ab"
+                downloaded = resume_from
+            else:
+                mode = "wb"
+                downloaded = 0
+                resume_from = 0
+
+            length_header = response.headers.get("Content-Length")
+            if length_header and length_header.isdigit():
+                total = int(length_header) + resume_from
+            else:
+                total = None
+
+        start_time = time.monotonic()
+        _print_progress(
+            downloaded,
+            total,
+            0.0,
+            filename=display_name,
+            initial=resume_from,
+            first=True,
+        )
+        last_progress = 0.0
+        with part.open(mode) as fh:
+            while True:
+                chunk = stream.read(256 * 1024)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                downloaded += len(chunk)
+                now = time.monotonic()
+                if now - last_progress >= 0.25:
+                    _print_progress(
+                        downloaded,
+                        total,
+                        now - start_time,
+                        filename=display_name,
+                        initial=resume_from,
+                    )
+                    last_progress = now
+
+        _print_progress(
+            downloaded,
+            total,
+            time.monotonic() - start_time,
+            filename=display_name,
+            initial=resume_from,
+            final=True,
+        )
+
+    final_size = part.stat().st_size
+    if not gzipped and total is not None and final_size != total:
+        raise DownloaderError(f"下载不完整: {final_size} / {total} 字节")
+
+
+def _download_with_wget(
+    info: DownloadInfo,
+    part: Path,
+    *,
+    display_name: str,
+    timeout: float,
+) -> None:
+    """使用 wget 下载，并复用脚本的进度显示。"""
+    total = _content_length(info.url, timeout)
+    initial = part.stat().st_size if part.exists() else 0
+    if total is not None and initial > total:
+        _remove_partial_files(part)
+        initial = 0
+
+    command = [
+        "wget",
+        "-q",
+        "-c",
+        "-T",
+        str(max(1, int(timeout))),
+        "-U",
+        USER_AGENT,
+        "-O",
+        str(part),
+        info.url,
+    ]
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    start_time = time.monotonic()
+    _print_progress(
+        initial,
+        total,
+        0.0,
+        filename=display_name,
+        initial=initial,
+        first=True,
+    )
+    last_progress = 0.0
+    stderr = ""
+    try:
+        while process.poll() is None:
+            size = part.stat().st_size if part.exists() else 0
+            now = time.monotonic()
+            if now - last_progress >= 0.25:
+                _print_progress(
+                    size,
+                    total,
+                    now - start_time,
+                    filename=display_name,
+                    initial=initial,
+                )
+                last_progress = now
+            time.sleep(0.1)
+        _, stderr = process.communicate()
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+    if process.returncode != 0:
+        message = (stderr or "").strip().splitlines()
+        reason = message[-1] if message else f"退出码 {process.returncode}"
+        raise DownloaderError(f"wget 下载失败: {reason}")
+
+    final_size = part.stat().st_size if part.exists() else 0
+    _print_progress(
+        final_size,
+        total,
+        time.monotonic() - start_time,
+        filename=display_name,
+        initial=initial,
+        final=True,
+    )
+    if total is not None and final_size != total:
+        raise DownloaderError(f"下载不完整: {final_size} / {total} 字节")
+
+
+class Aria2Backend:
+    """管理本地 aria2c RPC 进程，并通过 aria2p 提交下载任务。"""
+
+    def __init__(self) -> None:
+        self.process: Optional[subprocess.Popen] = None
+        self.api: Any = None
+        self.port: Optional[int] = None
+
+    def _start(self, timeout: float) -> None:
+        if self.api is not None:
+            if self.process is not None and self.process.poll() is None:
+                return
+            self.close()
+
+        try:
+            import aria2p
+        except ImportError as error:
+            raise DownloaderError(
+                "缺少 aria2p，请运行：python -m pip install aria2p"
+            ) from error
+        if not _command_exists("aria2c"):
+            raise DownloaderError(
+                "未找到 aria2c，请先安装：\n"
+                "  pkg install aria2        # Termux\n"
+                "  sudo apt install aria2   # Debian/Ubuntu"
+            )
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            self.port = sock.getsockname()[1]
+        secret = secrets.token_hex(16)
+
+        command = [
+            "aria2c",
+            "--enable-rpc=true",
+            "--rpc-listen-all=false",
+            "--rpc-allow-origin-all=false",
+            f"--rpc-listen-port={self.port}",
+            f"--rpc-secret={secret}",
+            "--no-conf=true",
+            "--quiet=true",
+            "--console-log-level=warn",
+            "--max-concurrent-downloads=1",
+            "--file-allocation=none",
+            "--summary-interval=0",
+            "--download-result=hide",
+            f"--stop-with-process={os.getpid()}",
+        ]
+        kwargs: Dict[str, Any] = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        else:
+            kwargs["start_new_session"] = True
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **kwargs,
+            )
+        except OSError as error:
+            raise DownloaderError(f"启动 aria2c 失败: {error}") from error
+
+        self.api = aria2p.API(
+            aria2p.Client(
+                host="http://127.0.0.1",
+                port=self.port,
+                secret=secret,
+                timeout=max(10.0, timeout),
+            )
+        )
+        deadline = time.monotonic() + ARIA2_START_TIMEOUT
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                code = self.process.returncode
+                self.close()
+                raise DownloaderError(f"aria2c 启动失败（退出码 {code}）")
+            try:
+                self.api.client.get_version()
+                return
+            except Exception:
+                time.sleep(0.1)
+
+        self.close()
+        raise DownloaderError("aria2c RPC 启动超时")
+
+    def download(
+        self,
+        info: DownloadInfo,
+        part: Path,
+        *,
+        display_name: str,
+        timeout: float,
+    ) -> None:
+        self._start(timeout)
+
+        options = {
+            "dir": str(part.parent),
+            "out": part.name,
+            "continue": "true",
+            "split": str(ARIA2_CONNECTIONS),
+            "max-connection-per-server": str(ARIA2_CONNECTIONS),
+            "min-split-size": "1M",
+            "file-allocation": "none",
+            "auto-file-renaming": "false",
+            "allow-overwrite": "true",
+            "max-tries": "1",
+            "retry-wait": "2",
+            "timeout": str(max(1, int(timeout))),
+            "connect-timeout": str(max(1, int(timeout))),
+            "user-agent": USER_AGENT,
+            "http-accept-gzip": "false",
+            "summary-interval": "0",
+            "download-result": "hide",
+        }
+        proxy = (
+            os.environ.get("HTTPS_PROXY")
+            or os.environ.get("https_proxy")
+            or os.environ.get("HTTP_PROXY")
+            or os.environ.get("http_proxy")
+        )
+        if proxy:
+            options["all-proxy"] = proxy
+
+        try:
+            download = self.api.add_uris([info.url], options=options)
+        except Exception as error:
+            raise DownloaderError(f"aria2 添加下载失败: {error}") from error
+
+        initial = download.completed_length or 0
+        total = download.total_length or None
+        start_time = time.monotonic()
+        _print_progress(
+            initial,
+            total,
+            0.0,
+            filename=display_name,
+            initial=initial,
+            first=True,
+        )
+        last_progress = 0.0
+        try:
+            while True:
+                download.update()
+                total = download.total_length or total
+                completed = download.completed_length or 0
+                if download.is_complete:
+                    break
+                if download.has_failed or download.is_removed:
+                    reason = download.error_message or download.status
+                    raise DownloaderError(f"aria2 下载失败: {reason}")
+                now = time.monotonic()
+                if now - last_progress >= 0.25:
+                    _print_progress(
+                        completed,
+                        total,
+                        now - start_time,
+                        filename=display_name,
+                        initial=initial,
+                    )
+                    last_progress = now
+                time.sleep(0.25)
+        except BaseException:
+            try:
+                download.remove(force=True, files=False)
+            except Exception:
+                pass
+            raise
+
+        final_size = part.stat().st_size if part.exists() else 0
+        _print_progress(
+            final_size,
+            total,
+            time.monotonic() - start_time,
+            filename=display_name,
+            initial=initial,
+            final=True,
+        )
+        try:
+            download.purge()
+        except Exception:
+            pass
+        if total is not None and final_size != total:
+            raise DownloaderError(f"下载不完整: {final_size} / {total} 字节")
+
+    def close(self) -> None:
+        process = self.process
+        self.process = None
+        self.api = None
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+
+
+_aria2_backend: Optional[Aria2Backend] = None
+
+
+def _get_aria2_backend() -> Aria2Backend:
+    global _aria2_backend
+    if _aria2_backend is None:
+        _aria2_backend = Aria2Backend()
+        atexit.register(_aria2_backend.close)
+    return _aria2_backend
+
+
 def download_file(
     info: DownloadInfo,
     dest: Path,
@@ -534,143 +1000,92 @@ def download_file(
     timeout: float = 60.0,
     allow_resume: bool = True,
     verify: bool = True,
+    download_method: str = "native",
 ) -> str:
     """
     下载文件，返回 downloaded / skipped / dry-run。
 
     - 下载到 .part 文件，完成后再原子重命名；
     - allow_resume=True 时支持 HTTP Range 断点续传；
-    - verify=True 且 info.sha256 存在时校验 SHA256。
+    - verify=True 且 info.sha256 存在时校验 SHA256；
+    - download_method 为 aria2 / wget / native。VSIX 固定使用 native，
+      以正确处理 Marketplace 的 gzip 响应。
     """
     dest = Path(dest)
     part = dest.with_name(dest.name + ".part")
+    method = download_method if allow_resume else "native"
 
     if dest.exists() and dest.stat().st_size > 0 and not force:
         if not dry_run:
-            part.unlink(missing_ok=True)
+            _remove_partial_files(part)
         detail(f"已存在，跳过: {dest}")
         return "skipped"
 
     if dry_run:
-        detail(f"[dry-run] -> {dest}")
+        detail(f"[dry-run] {download_method_label(method)} -> {dest}")
         detail(f"          {info.url}")
         return "dry-run"
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     if force:
         dest.unlink(missing_ok=True)
-        part.unlink(missing_ok=True)
+        _remove_partial_files(part)
     elif not allow_resume:
-        part.unlink(missing_ok=True)
+        _remove_partial_files(part)
+    elif method != "aria2":
+        # aria2 会生成稀疏文件，切回 wget/原生时不能按文件大小续传。
+        control = part.with_name(part.name + ".aria2")
+        if control.exists():
+            _remove_partial_files(part)
 
     last_error: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
-            resume_from = 0
-            if allow_resume and part.exists():
-                resume_from = part.stat().st_size
-
-            request_headers: Dict[str, str] = {}
-            if resume_from > 0:
-                request_headers["Range"] = f"bytes={resume_from}-"
-
-            request = make_request(info.url, headers=request_headers)
-            with urlopen(request, timeout=timeout) as response:
-                status = getattr(response, "status", 200)
-                if status == 416 and resume_from > 0:
-                    part.unlink(missing_ok=True)
-                    raise DownloaderError("服务器拒绝断点续传，准备重新下载")
-
-                content_encoding = (
-                    response.headers.get("Content-Encoding", "") or ""
-                ).lower()
-                gzipped = "gzip" in content_encoding
-
-                if gzipped and resume_from > 0 and status == 206:
-                    # Range 作用于压缩后的字节流，无法直接拼接解压后的内容。
-                    part.unlink(missing_ok=True)
-                    raise DownloaderError("服务器返回压缩内容，无法断点续传")
-
-                if gzipped:
-                    stream: Any = gzip.GzipFile(fileobj=response)
-                    mode = "wb"
-                    downloaded = 0
-                    total: Optional[int] = None
-                else:
-                    stream = response
-                    if resume_from > 0 and status == 206:
-                        mode = "ab"
-                        downloaded = resume_from
-                    else:
-                        mode = "wb"
-                        downloaded = 0
-                        resume_from = 0
-
-                    length_header = response.headers.get("Content-Length")
-                    if length_header and length_header.isdigit():
-                        total = int(length_header) + resume_from
-                    else:
-                        total = None
-
-                start_time = time.monotonic()
-                _print_progress(
-                    downloaded,
-                    total,
-                    0.0,
-                    filename=dest.name,
-                    initial=resume_from,
-                    first=True,
+            if method == "aria2":
+                _get_aria2_backend().download(
+                    info,
+                    part,
+                    display_name=dest.name,
+                    timeout=timeout,
                 )
-                last_progress = 0.0
-                with part.open(mode) as fh:
-                    while True:
-                        chunk = stream.read(256 * 1024)
-                        if not chunk:
-                            break
-                        fh.write(chunk)
-                        downloaded += len(chunk)
-                        now = time.monotonic()
-                        if now - last_progress >= 0.25:
-                            _print_progress(
-                                downloaded,
-                                total,
-                                now - start_time,
-                                filename=dest.name,
-                                initial=resume_from,
-                            )
-                            last_progress = now
-
-                _print_progress(
-                    downloaded,
-                    total,
-                    time.monotonic() - start_time,
-                    filename=dest.name,
-                    initial=resume_from,
-                    final=True,
+            elif method == "wget":
+                _download_with_wget(
+                    info,
+                    part,
+                    display_name=dest.name,
+                    timeout=timeout,
+                )
+            else:
+                _download_native(
+                    info,
+                    part,
+                    display_name=dest.name,
+                    timeout=timeout,
+                    allow_resume=allow_resume,
                 )
 
+            if not part.exists():
+                raise DownloaderError("下载文件不存在")
             final_size = part.stat().st_size
-            if not gzipped and total is not None and final_size != total:
-                raise DownloaderError(
-                    f"下载不完整: {final_size} / {total} 字节"
-                )
-
+            if final_size <= 0:
+                raise DownloaderError("下载文件为空")
             if verify and info.sha256:
                 actual = sha256_file(part)
                 if actual.lower() != info.sha256.lower():
-                    part.unlink(missing_ok=True)
+                    _remove_partial_files(part)
                     raise DownloaderError(
                         f"SHA256 校验失败: 期望 {info.sha256}, 实际 {actual}"
                     )
 
             os.replace(part, dest)
+            part.with_name(part.name + ".aria2").unlink(missing_ok=True)
             detail(f"完成: {dest} ({format_size(final_size)})")
             return "downloaded"
 
         except DownloaderError as error:
             last_error = error
             if not allow_resume:
-                part.unlink(missing_ok=True)
+                _remove_partial_files(part)
             if attempt >= retries:
                 break
             wait = min(2 ** (attempt - 1), 8)
@@ -682,7 +1097,7 @@ def download_file(
         except HTTPError as error:
             last_error = DownloaderError(http_error_message(error, info.url))
             if not allow_resume:
-                part.unlink(missing_ok=True)
+                _remove_partial_files(part)
             # 这类错误重试也没有意义
             if error.code in (400, 401, 403, 404):
                 break
@@ -704,7 +1119,7 @@ def download_file(
         ) as error:
             last_error = DownloaderError(f"网络错误: {error}")
             if not allow_resume:
-                part.unlink(missing_ok=True)
+                _remove_partial_files(part)
             if attempt >= retries:
                 break
             wait = min(2 ** (attempt - 1), 8)
@@ -1092,6 +1507,7 @@ def download_installers(
     dry_run: bool,
     retries: int,
     timeout: float,
+    download_method: str,
     vscode_version: Optional[str] = None,
     stats: RunStats,
 ) -> None:
@@ -1099,6 +1515,7 @@ def download_installers(
     if not targets:
         detail("未选择安装包，跳过。")
         return
+    detail(f"下载方式: {download_method_label(download_method)}")
 
     resolved: List[Tuple[PackageTarget, DownloadInfo]] = []
     for target in targets:
@@ -1128,6 +1545,7 @@ def download_installers(
                 timeout=timeout,
                 allow_resume=True,
                 verify=True,
+                download_method=download_method,
             )
             stats.record(result, target.platform)
         except DownloaderError as error:
@@ -1142,12 +1560,14 @@ def download_remote(
     dry_run: bool,
     retries: int,
     timeout: float,
+    download_method: str,
     vscode_version: Optional[str] = None,
     stats: RunStats,
 ) -> None:
     print("\n[2/3] 远程开发 Server + CLI")
     platforms = list(REMOTE_SERVERS) + list(REMOTE_CLIS[cli_flavor])
     resolved: List[Tuple[str, DownloadInfo]] = []
+    detail(f"下载方式: {download_method_label(download_method)}")
 
     for platform, label in platforms:
         try:
@@ -1176,6 +1596,7 @@ def download_remote(
                 timeout=timeout,
                 allow_resume=True,
                 verify=True,
+                download_method=download_method,
             )
             stats.record(result, label)
         except DownloaderError as error:
@@ -1878,6 +2299,8 @@ def build_parser() -> argparse.ArgumentParser:
             "示例:\n"
             "  python vscode_offline_downloader.py all\n"
             "  python vscode_offline_downloader.py installers --dry-run\n"
+            "  python vscode_offline_downloader.py installers "
+            "--download-method aria2\n"
             "  python vscode_offline_downloader.py installers --targets "
             "win32-x64-user,linux-deb-x64,linux-deb-arm64\n"
             "  python vscode_offline_downloader.py extensions --config download_config.yaml\n"
@@ -1899,6 +2322,15 @@ def build_parser() -> argparse.ArgumentParser:
             "all 表示全部，none 表示不下载安装包。"
             "不指定时：有配置文件则直接使用 vscode.targets；"
             "没有配置文件才显示复选框。"
+        ),
+    )
+    parser.add_argument(
+        "--download-method",
+        choices=["aria2", "wget", "none"],
+        default=None,
+        help=(
+            "下载方式：aria2（多连接）、wget 或 none（内置 urllib）；"
+            "不指定时自动选择 aria2 > wget > 内置"
         ),
     )
     parser.add_argument(
@@ -1984,6 +2416,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     config_exists = config_path.exists()
 
     try:
+        download_method = "native"
+        if args.action != "extensions":
+            download_method = resolve_download_method(args.download_method)
+
         if args.action == "extensions":
             if not config_exists:
                 raise DownloaderError(
@@ -2056,6 +2492,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 dry_run=args.dry_run,
                 retries=args.retries,
                 timeout=args.timeout,
+                download_method=download_method,
                 vscode_version=vscode_version,
                 stats=stats,
             )
@@ -2084,6 +2521,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 dry_run=args.dry_run,
                 retries=args.retries,
                 timeout=args.timeout,
+                download_method=download_method,
                 vscode_version=vscode_version,
                 stats=stats,
             )
@@ -2119,6 +2557,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 dry_run=args.dry_run,
                 retries=args.retries,
                 timeout=args.timeout,
+                download_method=download_method,
                 stats=stats,
             )
             print_summary(stats, args.dry_run)
@@ -2165,6 +2604,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             dry_run=args.dry_run,
             retries=args.retries,
             timeout=args.timeout,
+            download_method=download_method,
             vscode_version=config.vscode_version,
             stats=stats,
         )
@@ -2179,6 +2619,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 dry_run=args.dry_run,
                 retries=args.retries,
                 timeout=args.timeout,
+                download_method=download_method,
                 vscode_version=config.vscode_version,
                 stats=stats,
             )

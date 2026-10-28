@@ -13,6 +13,7 @@ Thumbs.db
 
 # Downloader output
 *.part
+*.aria2
 *.vsix
 *.exe
 *.deb
