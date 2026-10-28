@@ -436,9 +436,11 @@ def _print_progress(
     initial: int = 0,
     first: bool = False,
     final: bool = False,
+    speed: Optional[float] = None,
 ) -> None:
-    session_bytes = max(0, done - initial)
-    speed = session_bytes / elapsed if elapsed > 0 else 0.0
+    if speed is None:
+        session_bytes = max(0, done - initial)
+        speed = session_bytes / elapsed if elapsed > 0 else 0.0
     speed_text = f"{format_size(speed)}/s" if speed > 0 else "--"
     done_text = format_size(done)
     total_text = format_size(total) if total else "?"
@@ -529,6 +531,45 @@ def _print_progress(
     if final:
         sys.stderr.write("\n")
     sys.stderr.flush()
+
+
+class SpeedMeter:
+    """用滑动窗口计算实时速度，避免启动瞬间的缓存突发拉高显示值。"""
+
+    def __init__(
+        self,
+        done: int = 0,
+        *,
+        warmup: float = 1.0,
+        window: float = 1.0,
+    ) -> None:
+        now = time.monotonic()
+        self.start_time = now
+        self.warmup = warmup
+        self.window = window
+        self.samples: List[Tuple[float, int]] = [(now, done)]
+        self.ready = False
+        self.speed = 0.0
+
+    def update(self, done: int, now: Optional[float] = None) -> float:
+        now = time.monotonic() if now is None else now
+        if not self.ready:
+            if now - self.start_time < self.warmup:
+                return 0.0
+            self.ready = True
+            self.samples = [(now, done)]
+            return 0.0
+
+        self.samples.append((now, done))
+        cutoff = now - self.window
+        while len(self.samples) > 2 and self.samples[0][0] < cutoff:
+            self.samples.pop(0)
+
+        first_time, first_done = self.samples[0]
+        elapsed = now - first_time
+        if elapsed > 0:
+            self.speed = max(0, done - first_done) / elapsed
+        return self.speed
 
 
 def _remove_partial_files(part: Path) -> None:
@@ -652,6 +693,7 @@ def _download_native(
                 total = None
 
         start_time = time.monotonic()
+        meter = SpeedMeter(resume_from)
         _print_progress(
             downloaded,
             total,
@@ -676,6 +718,7 @@ def _download_native(
                         now - start_time,
                         filename=display_name,
                         initial=resume_from,
+                        speed=meter.update(downloaded, now),
                     )
                     last_progress = now
 
@@ -726,6 +769,7 @@ def _download_with_wget(
         text=True,
     )
     start_time = time.monotonic()
+    meter = SpeedMeter(initial)
     _print_progress(
         initial,
         total,
@@ -747,6 +791,7 @@ def _download_with_wget(
                     now - start_time,
                     filename=display_name,
                     initial=initial,
+                    speed=meter.update(size, now),
                 )
                 last_progress = now
             time.sleep(0.1)
@@ -910,6 +955,7 @@ class Aria2Backend:
         initial = download.completed_length or 0
         total = download.total_length or None
         start_time = time.monotonic()
+        meter = SpeedMeter(initial)
         _print_progress(
             initial,
             total,
@@ -937,6 +983,7 @@ class Aria2Backend:
                         now - start_time,
                         filename=display_name,
                         initial=initial,
+                        speed=meter.update(completed, now),
                     )
                     last_progress = now
                 time.sleep(0.25)
