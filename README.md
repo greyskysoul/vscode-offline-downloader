@@ -225,12 +225,16 @@ vscode:
 | `version` | 否 | 插件版本；留空或省略表示最新版本 |
 | `target` | 否 | 平台专用版本，如 `win32-x64`、`linux-x64`、`linux-arm64`、`alpine-x64` |
 
-平台专用插件需要写 `target`。实际下载的架构会跟随 `vscode.targets`，而不是固定使用
+平台专用插件可以写 `target` 标记。实际下载的架构会跟随 `vscode.targets`，而不是固定使用
 这里的 `target`：
 
 - `vscode.targets` 选择 `linux-arm64`，就只下载 `linux-arm64` 插件变体；
 - 选择多个架构时，每个架构各下载一个变体；
 - 配置里有对应架构的条目时沿用其版本，否则使用该架构的最新版本。
+
+如果插件没有写 `target`，但 Marketplace 上只提供平台专用版本（或平台版本明显新于
+通用版本），脚本会自动按 `vscode.targets` 展开。例如 `ms-vscode.cpptools`
+不需要手动写多个 `target`，选择三个 VS Code 平台就会下载三个架构的 VSIX。
 
 如果写了 `target` 但 `version` 留空，脚本会自动选择该平台的最新版本。
 

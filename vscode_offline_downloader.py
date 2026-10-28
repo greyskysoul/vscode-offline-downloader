@@ -1657,6 +1657,7 @@ def download_remote(
 
 
 _gallery_cache: Dict[Tuple[str, bool], List[Dict[str, Any]]] = {}
+_platform_specific_cache: Dict[str, bool] = {}
 
 
 def parse_extension_id(name: str) -> Tuple[str, str]:
@@ -2013,9 +2014,48 @@ def extension_targets_for_vscode_targets(
     return result
 
 
+def is_platform_specific_extension(name: str, timeout: float) -> bool:
+    """
+    判断插件是否只提供平台专用版本。
+
+    有些插件（例如 cpptools）保留了很旧的通用版本，但新版本只按平台发布。
+    如果平台版本明显新于通用版本，就按平台专用插件处理。
+    """
+    cache_key = name.lower()
+    if cache_key in _platform_specific_cache:
+        return _platform_specific_cache[cache_key]
+
+    versions = get_extension_versions(name, timeout)
+    universal: List[str] = []
+    targeted: List[str] = []
+    for item in versions:
+        version = str(item.get("version") or "")
+        if not version:
+            continue
+        target = (item.get("targetPlatform") or "").lower()
+        if not target or target == "universal":
+            universal.append(version)
+        else:
+            targeted.append(version)
+
+    if not targeted:
+        result = False
+    elif not universal:
+        result = True
+    else:
+        result = version_key(max(targeted, key=version_key)) > version_key(
+            max(universal, key=version_key)
+        )
+
+    _platform_specific_cache[cache_key] = result
+    return result
+
+
 def adapt_extension_specs(
     specs: List[ExtensionSpec],
     selected_targets: List[str],
+    *,
+    timeout: float = 60.0,
 ) -> List[ExtensionSpec]:
     """
     让平台专用插件的架构跟随 VS Code 的选择。
@@ -2023,7 +2063,8 @@ def adapt_extension_specs(
     - 通用插件保持不变；
     - 配置里带 target 的插件按 (name, path) 分组；
     - 每个选中的架构生成一个下载项；
-    - 如果配置里有该架构的精确条目，沿用其版本，否则用该架构的最新版本。
+    - 如果配置里有该架构的精确条目，沿用其版本，否则用该架构的最新版本；
+    - 没有写 target，但 Marketplace 上只有平台专用版本的插件，也会自动按架构展开。
     """
     if not selected_targets:
         return list(specs)
@@ -2040,8 +2081,31 @@ def adapt_extension_specs(
     adapted: List[ExtensionSpec] = []
     for key in order:
         group = groups[key]
+        base = group[0]
         if not any(spec.target for spec in group):
-            base = group[0]
+            auto_platform = False
+            if base.version is None:
+                try:
+                    auto_platform = is_platform_specific_extension(
+                        base.name, timeout
+                    )
+                except DownloaderError as error:
+                    warn(
+                        f"无法判断 {base.name} 是否需要按架构下载，"
+                        f"按通用版本处理: {error}"
+                    )
+            if auto_platform:
+                for target in selected_targets:
+                    adapted.append(
+                        ExtensionSpec(
+                            name=base.name,
+                            path=base.path,
+                            version=None,
+                            target=target,
+                        )
+                    )
+                continue
+
             adapted.append(
                 ExtensionSpec(
                     name=base.name,
@@ -2479,7 +2543,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 config.vscode_targets
             )
             specs = adapt_extension_specs(
-                config.extensions, plugin_targets
+                config.extensions, plugin_targets, timeout=args.timeout
             )
             if not confirm_download_plan(
                 [extension_plan_section(specs)],
@@ -2623,7 +2687,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             plugin_targets = extension_targets_for_vscode_targets(
                 config.vscode_targets
             )
-        specs = adapt_extension_specs(config.extensions, plugin_targets)
+        specs = adapt_extension_specs(
+            config.extensions, plugin_targets, timeout=args.timeout
+        )
 
         sections = [
             installer_plan_section(
